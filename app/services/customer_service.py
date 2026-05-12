@@ -1,141 +1,166 @@
 """
 app/services/customer_service.py
 ---------------------------------
-Business logic layer for customer CRUD operations.
+Business-logic layer for customer CRUD operations.
 
-All persistence is delegated to the in-memory store in ``app.data.mock_data``.
-The service layer is intentionally decoupled from Flask so it can be tested
-independently of the HTTP layer.
+``CustomerService`` enforces domain rules (required fields, email
+uniqueness) and delegates all persistence to ``CustomerRepository``.
+It is intentionally decoupled from Flask so it can be unit-tested
+without starting a server or touching a real database – callers may
+inject a mock repository for fully isolated tests.
 
 Classes
 -------
 CustomerService
-    Provides create / read / update / delete methods for Customer records.
+    Create / read / update / delete operations for Customer records.
 """
 
 from typing import Any
 
-from app.data.mock_data import get_next_id, get_store
+from app.exceptions import CustomerNotFoundError, EmailAlreadyExistsError, ValidationError
 from app.models.customer import Customer
+from app.repositories.customer_repo import CustomerRepository
 
-# Fields required when creating a new customer
+#: Fields that must be present and non-blank when creating a new customer.
 _REQUIRED_FIELDS: frozenset[str] = frozenset({"name", "email", "phone", "address"})
 
 
 class CustomerService:
-    """Encapsulates all business logic for customer management.
+    """Business logic for customer management.
 
-    The service operates on the shared in-memory store and enforces
-    domain rules such as email uniqueness and required-field validation.
+    Dependency injection is used for the repository so the service can
+    be tested in isolation::
+
+        mock_repo = MagicMock(spec=CustomerRepository)
+        service   = CustomerService(repository=mock_repo)
+
+    Args:
+        repository (CustomerRepository | None): Data-access object.
+            Defaults to a real ``CustomerRepository`` instance when
+            ``None`` is passed (production path).
     """
+
+    def __init__(self, repository: CustomerRepository | None = None) -> None:
+        self._repo: CustomerRepository = repository or CustomerRepository()
 
     # ------------------------------------------------------------------
     # Read operations
     # ------------------------------------------------------------------
 
     def get_all(self) -> list[dict]:
-        """Return every customer in the store.
+        """Return every customer serialised to a dictionary.
 
         Returns:
-            list[dict]: Serialized list of all customer records.
+            list[dict]: All customers ordered by ascending ID.
         """
-        return [c.to_dict() for c in get_store().values()]
+        return [c.to_dict() for c in self._repo.get_all()]
 
-    def get_by_id(self, customer_id: int) -> dict | None:
+    def get_by_id(self, customer_id: int) -> dict:
         """Return a single customer by primary key.
 
         Args:
-            customer_id (int): The unique customer ID to look up.
+            customer_id (int): ID to look up.
 
         Returns:
-            dict | None: Serialized customer, or ``None`` if not found.
+            dict: Serialised customer record.
+
+        Raises:
+            CustomerNotFoundError: If *customer_id* does not exist.
         """
-        customer = get_store().get(customer_id)
-        return customer.to_dict() if customer else None
+        customer = self._repo.get_by_id(customer_id)
+        if customer is None:
+            raise CustomerNotFoundError(customer_id)
+        return customer.to_dict()
 
     # ------------------------------------------------------------------
     # Write operations
     # ------------------------------------------------------------------
 
     def create(self, data: dict[str, Any]) -> dict:
-        """Add a new customer to the store.
+        """Create and persist a new customer from validated input.
 
         Args:
-            data (dict): Must contain ``name``, ``email``, ``phone``, and
-                ``address`` keys.
+            data (dict): Must contain ``name``, ``email``, ``phone``,
+                and ``address`` keys with non-blank string values.
 
         Returns:
-            dict: The newly created customer record.
+            dict: The newly created and persisted customer record.
 
         Raises:
-            ValueError: If required fields are missing or the email is
-                already registered.
+            ValidationError: If any required field is absent or blank.
+            EmailAlreadyExistsError: If the email is already registered.
         """
         self._validate_required_fields(data)
-        self._assert_email_unique(data["email"])
 
-        new_id = get_next_id()
+        email = data["email"].strip().lower()
+        if self._repo.get_by_email(email) is not None:
+            raise EmailAlreadyExistsError(email)
+
         customer = Customer(
-            id=new_id,
             name=data["name"].strip(),
-            email=data["email"].strip().lower(),
+            email=email,
             phone=data["phone"].strip(),
             address=data["address"].strip(),
         )
-        get_store()[new_id] = customer
-        return customer.to_dict()
+        saved = self._repo.add(customer)
+        return saved.to_dict()
 
-    def update(self, customer_id: int, data: dict[str, Any]) -> dict | None:
-        """Partially update an existing customer.
+    def update(self, customer_id: int, data: dict[str, Any]) -> dict:
+        """Partially update an existing customer (PATCH semantics).
 
-        Only keys present in *data* are modified; all others are left
-        unchanged (PATCH semantics applied via the PUT endpoint).
+        Only keys supplied in *data* are modified; all other fields
+        remain unchanged.  Unknown keys are silently ignored.
 
         Args:
             customer_id (int): ID of the customer to update.
-            data (dict): Fields to update (any subset of name / email /
-                phone / address).
+            data (dict): Subset of ``name``, ``email``, ``phone``,
+                ``address`` to overwrite.
 
         Returns:
-            dict | None: Updated customer, or ``None`` if ID not found.
+            dict: The updated customer record after persistence.
 
         Raises:
-            ValueError: If the supplied email is already taken by a
-                different customer.
+            CustomerNotFoundError: If *customer_id* does not exist.
+            EmailAlreadyExistsError: If the new email is already taken
+                by a different customer.
         """
-        store = get_store()
-        customer = store.get(customer_id)
+        customer = self._repo.get_by_id(customer_id)
         if customer is None:
-            return None
+            raise CustomerNotFoundError(customer_id)
 
-        if "email" in data:
-            self._assert_email_unique(data["email"].strip().lower(), exclude_id=customer_id)
-            customer.email = data["email"].strip().lower()
-
-        if "name" in data:
+        if "name" in data and data["name"].strip():
             customer.name = data["name"].strip()
-        if "phone" in data:
+
+        if "phone" in data and data["phone"].strip():
             customer.phone = data["phone"].strip()
-        if "address" in data:
+
+        if "address" in data and data["address"].strip():
             customer.address = data["address"].strip()
 
-        return customer.to_dict()
+        if "email" in data:
+            new_email = data["email"].strip().lower()
+            if new_email != customer.email:
+                existing = self._repo.get_by_email(new_email)
+                if existing is not None:
+                    raise EmailAlreadyExistsError(new_email)
+                customer.email = new_email
 
-    def delete(self, customer_id: int) -> bool:
-        """Remove a customer from the store.
+        saved = self._repo.save(customer)
+        return saved.to_dict()
+
+    def delete(self, customer_id: int) -> None:
+        """Delete a customer by primary key.
 
         Args:
-            customer_id (int): ID of the customer to delete.
+            customer_id (int): ID of the customer to remove.
 
-        Returns:
-            bool: ``True`` if the record was deleted, ``False`` if the
-                ID did not exist.
+        Raises:
+            CustomerNotFoundError: If *customer_id* does not exist.
         """
-        store = get_store()
-        if customer_id not in store:
-            return False
-        del store[customer_id]
-        return True
+        customer = self._repo.get_by_id(customer_id)
+        if customer is None:
+            raise CustomerNotFoundError(customer_id)
+        self._repo.delete(customer)
 
     # ------------------------------------------------------------------
     # Private helpers
@@ -143,31 +168,17 @@ class CustomerService:
 
     @staticmethod
     def _validate_required_fields(data: dict[str, Any]) -> None:
-        """Raise ``ValueError`` if any required field is absent.
+        """Ensure all required fields are present and contain non-blank values.
 
         Args:
-            data (dict): The incoming request payload.
+            data (dict): Raw input dictionary from the caller.
 
         Raises:
-            ValueError: Lists all missing fields in the message.
+            ValidationError: Lists all missing / blank fields in the
+                exception message.
         """
-        missing = _REQUIRED_FIELDS - data.keys()
+        missing = [f for f in _REQUIRED_FIELDS if not str(data.get(f, "")).strip()]
         if missing:
-            raise ValueError(f"Missing required fields: {sorted(missing)}")
-
-    @staticmethod
-    def _assert_email_unique(email: str, exclude_id: int | None = None) -> None:
-        """Raise ``ValueError`` if the email is already in use.
-
-        Args:
-            email (str): Email address to check.
-            exclude_id (int | None): Customer ID to skip during the
-                check (used for update to allow keeping the same email).
-
-        Raises:
-            ValueError: If the email belongs to another customer record.
-        """
-        normalised = email.strip().lower()
-        for customer in get_store().values():
-            if customer.email == normalised and customer.id != exclude_id:
-                raise ValueError(f"Email '{normalised}' is already registered.")
+            raise ValidationError(
+                f"Missing or blank required field(s): {', '.join(sorted(missing))}."
+            )

@@ -18,10 +18,14 @@ All responses use the envelope::
         "data":   <payload>,          # present on success
         "message": "<description>"    # present on error
     }
+
+Exceptions raised by the service layer are caught here and translated
+into the appropriate HTTP status codes without leaking internal detail.
 """
 
 from flask import Blueprint, jsonify, request
 
+from app.exceptions import CustomerNotFoundError, EmailAlreadyExistsError, ValidationError
 from app.services.customer_service import CustomerService
 
 customer_bp = Blueprint("customers", __name__, url_prefix="/api/customers")
@@ -71,9 +75,10 @@ def get_customer(customer_id: int):
 
         { "status": "error", "message": "Customer 99 not found." }
     """
-    customer = _service.get_by_id(customer_id)
-    if customer is None:
-        return _not_found(customer_id)
+    try:
+        customer = _service.get_by_id(customer_id)
+    except CustomerNotFoundError as exc:
+        return _not_found(str(exc))
     return jsonify({"status": "success", "data": customer}), 200
 
 
@@ -105,7 +110,7 @@ def create_customer():
 
         { "status": "error", "message": "Request body must be valid JSON." }
 
-    Response 422 – validation error::
+    Response 422 – validation / conflict error::
 
         { "status": "error", "message": "<reason>" }
     """
@@ -114,7 +119,7 @@ def create_customer():
         return _bad_request("Request body must be valid JSON.")
     try:
         customer = _service.create(data)
-    except ValueError as exc:
+    except (ValidationError, EmailAlreadyExistsError) as exc:
         return _unprocessable(str(exc))
     return jsonify({"status": "success", "data": customer}), 201
 
@@ -147,10 +152,10 @@ def update_customer(customer_id: int):
         return _bad_request("Request body must be valid JSON.")
     try:
         customer = _service.update(customer_id, data)
-    except ValueError as exc:
+    except CustomerNotFoundError as exc:
+        return _not_found(str(exc))
+    except EmailAlreadyExistsError as exc:
         return _unprocessable(str(exc))
-    if customer is None:
-        return _not_found(customer_id)
     return jsonify({"status": "success", "data": customer}), 200
 
 
@@ -173,9 +178,10 @@ def delete_customer(customer_id: int):
 
         { "status": "error", "message": "Customer 99 not found." }
     """
-    deleted = _service.delete(customer_id)
-    if not deleted:
-        return _not_found(customer_id)
+    try:
+        _service.delete(customer_id)
+    except CustomerNotFoundError as exc:
+        return _not_found(str(exc))
     return jsonify({"status": "success", "message": f"Customer {customer_id} deleted."}), 200
 
 
@@ -184,8 +190,8 @@ def delete_customer(customer_id: int):
 # ---------------------------------------------------------------------------
 
 
-def _not_found(customer_id: int):
-    return jsonify({"status": "error", "message": f"Customer {customer_id} not found."}), 404
+def _not_found(message: str):
+    return jsonify({"status": "error", "message": message}), 404
 
 
 def _bad_request(message: str):

@@ -2,8 +2,302 @@
 
 ## Overview
 
-A RESTful API that manages **Customer** records using an in-memory mock data store.  
-Base URL: `http://127.0.0.1:5000`
+A RESTful API that manages **Customer** records backed by a **SQLite** database
+(switchable to PostgreSQL or MySQL via the `DATABASE_URL` environment variable).
+
+```
+Base URL: http://127.0.0.1:5000
+```
+
+---
+
+## Architecture
+
+```
+┌─────────────┐     HTTP      ┌──────────────────┐
+│   Client    │──────────────▶│   Route layer     │  app/routes/
+└─────────────┘               │  (Flask Blueprint) │
+                               └────────┬─────────┘
+                                        │ calls
+                               ┌────────▼─────────┐
+                               │  Service layer    │  app/services/
+                               │  (business rules) │
+                               └────────┬─────────┘
+                                        │ delegates
+                               ┌────────▼─────────┐
+                               │ Repository layer  │  app/repositories/
+                               │ (DB access only)  │
+                               └────────┬─────────┘
+                                        │ SQLAlchemy ORM
+                               ┌────────▼─────────┐
+                               │    Database       │  SQLite / PostgreSQL
+                               └──────────────────┘
+```
+
+### Layer responsibilities
+
+| Layer        | Module                       | Responsibility                                    |
+|--------------|------------------------------|---------------------------------------------------|
+| Routes       | `app/routes/customer_routes` | HTTP routing, request parsing, response envelope  |
+| Service      | `app/services/customer_service` | Business rules, validation, domain exceptions  |
+| Repository   | `app/repositories/customer_repo` | All SQLAlchemy queries, commit / rollback      |
+| Model        | `app/models/customer`        | ORM mapping, `to_dict` serialisation             |
+| Config       | `app/config`                 | Environment-based configuration                   |
+| Exceptions   | `app/exceptions`             | Typed domain exceptions (`CustomerNotFoundError`, …) |
+
+---
+
+## Configuration
+
+| Environment key | Default                  | Notes                                   |
+|-----------------|--------------------------|-----------------------------------------|
+| `DATABASE_URL`  | `sqlite:///customers_dev.db` | Any SQLAlchemy-compatible URI       |
+| `FLASK_ENV`     | `development`            | `development` · `testing` · `production` |
+| `SECRET_KEY`    | `dev-secret-…`           | **Override in production**              |
+
+---
+
+## Data Model
+
+| Field        | Type     | Description                          | Required on create |
+|--------------|----------|--------------------------------------|--------------------|
+| `id`         | integer  | Auto-assigned unique identifier      | No (auto)          |
+| `name`       | string   | Full name of the customer (≤ 255 chars) | **Yes**         |
+| `email`      | string   | Unique, lower-cased email (≤ 255 chars) | **Yes**         |
+| `phone`      | string   | Contact phone number (≤ 50 chars)    | **Yes**            |
+| `address`    | string   | Physical address (≤ 500 chars)       | **Yes**            |
+| `created_at` | datetime | UTC timestamp, ISO-8601 (auto-set)   | No (auto)          |
+
+---
+
+## Endpoints
+
+### 1. List All Customers
+
+```
+GET /api/customers
+```
+
+**Response 200**
+
+```json
+{
+  "status": "success",
+  "count": 2,
+  "data": [
+    {
+      "id": 1,
+      "name": "Alice Johnson",
+      "email": "alice.johnson@example.com",
+      "phone": "555-0101",
+      "address": "123 Main St, New York, NY 10001",
+      "created_at": "2024-01-15T10:00:00+00:00"
+    }
+  ]
+}
+```
+
+---
+
+### 2. Retrieve a Customer
+
+```
+GET /api/customers/<id>
+```
+
+**Response 200**
+
+```json
+{
+  "status": "success",
+  "data": {
+    "id": 1,
+    "name": "Alice Johnson",
+    "email": "alice.johnson@example.com",
+    "phone": "555-0101",
+    "address": "123 Main St, New York, NY 10001",
+    "created_at": "2024-01-15T10:00:00+00:00"
+  }
+}
+```
+
+**Response 404**
+
+```json
+{
+  "status": "error",
+  "message": "Customer 99 not found."
+}
+```
+
+---
+
+### 3. Create a Customer
+
+```
+POST /api/customers
+Content-Type: application/json
+```
+
+**Request body**
+
+```json
+{
+  "name":    "Jane Doe",
+  "email":   "jane.doe@example.com",
+  "phone":   "555-9999",
+  "address": "1 Example Lane, Austin, TX"
+}
+```
+
+**Response 201**
+
+```json
+{
+  "status": "success",
+  "data": {
+    "id": 3,
+    "name": "Jane Doe",
+    "email": "jane.doe@example.com",
+    "phone": "555-9999",
+    "address": "1 Example Lane, Austin, TX",
+    "created_at": "2026-05-09T12:00:00+00:00"
+  }
+}
+```
+
+**Response 400** — no JSON body or malformed JSON
+
+```json
+{ "status": "error", "message": "Request body must be valid JSON." }
+```
+
+**Response 422** — validation or conflict error
+
+```json
+{ "status": "error", "message": "Missing or blank required field(s): email." }
+```
+
+```json
+{ "status": "error", "message": "Email 'jane.doe@example.com' is already registered." }
+```
+
+---
+
+### 4. Update a Customer
+
+```
+PUT /api/customers/<id>
+Content-Type: application/json
+```
+
+Supply only the fields you wish to modify (PATCH semantics):
+
+```json
+{ "phone": "555-0000", "address": "New Address, NY" }
+```
+
+**Response 200**
+
+```json
+{
+  "status": "success",
+  "data": {
+    "id": 1,
+    "name": "Alice Johnson",
+    "email": "alice.johnson@example.com",
+    "phone": "555-0000",
+    "address": "New Address, NY",
+    "created_at": "2024-01-15T10:00:00+00:00"
+  }
+}
+```
+
+**Response 400** — missing or non-JSON body  
+**Response 404** — ID not found  
+**Response 422** — duplicate email  
+
+---
+
+### 5. Delete a Customer
+
+```
+DELETE /api/customers/<id>
+```
+
+**Response 200**
+
+```json
+{ "status": "success", "message": "Customer 3 deleted." }
+```
+
+**Response 404**
+
+```json
+{ "status": "error", "message": "Customer 3 not found." }
+```
+
+---
+
+## Error Envelope
+
+All error responses follow this structure:
+
+```json
+{
+  "status": "error",
+  "message": "<human-readable description>"
+}
+```
+
+| HTTP Status | Meaning                                    |
+|-------------|--------------------------------------------|
+| 200         | OK — request succeeded                     |
+| 201         | Created — new resource created             |
+| 400         | Bad Request — missing or invalid JSON body |
+| 404         | Not Found — customer ID does not exist     |
+| 422         | Unprocessable — validation / conflict error |
+
+---
+
+## Running the Application
+
+```bash
+# Install dependencies
+pip install -r requirements.txt
+
+# Development server (SQLite file, auto-reloads)
+python run.py
+
+# Production (set env vars and use gunicorn)
+DATABASE_URL=postgresql://user:pass@host/db FLASK_ENV=production gunicorn "app:create_app()"
+```
+
+---
+
+## Running the Test Suite
+
+```bash
+# All tests
+pytest
+
+# With coverage report
+pytest --cov=app --cov-report=term-missing
+
+# Specific test file
+pytest tests/test_customer_repository.py -v
+pytest tests/test_customer_service.py -v
+pytest tests/test_customer_routes.py -v
+```
+
+### Test layers
+
+| File                           | Layer tested  | DB used             |
+|--------------------------------|---------------|---------------------|
+| `test_customer_repository.py`  | Repository    | In-memory SQLite    |
+| `test_customer_service.py`     | Service       | Mock (no DB)        |
+| `test_customer_routes.py`      | Routes (HTTP) | In-memory SQLite    |
+
 
 ---
 

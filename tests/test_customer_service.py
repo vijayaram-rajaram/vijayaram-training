@@ -1,254 +1,292 @@
 """
 tests/test_customer_service.py
 --------------------------------
-Unit tests for CustomerService.
+Unit tests for ``CustomerService``.
 
-The test suite covers every public method of CustomerService and validates
-both the happy path and all documented error conditions.
+The repository is replaced with a ``MagicMock`` so these tests exercise
+*only* the service's business logic (validation, exception raising,
+delegation) without touching a real database.  This makes the suite fast
+and independent of any infrastructure.
 
-Each test calls ``mock_data.reset_store()`` in ``setUp`` to ensure a
-deterministic, isolated starting state (5 seed customers with IDs 1–5).
+Test groups
+-----------
+TestGetAll              – ``get_all``
+TestGetById             – ``get_by_id``
+TestCreate              – ``create``
+TestCreate_Validation   – ``create`` validation rules
+TestUpdate              – ``update``
+TestDelete              – ``delete``
 """
 
-import unittest
+from datetime import datetime, timezone
+from unittest.mock import MagicMock
 
-from app.data import mock_data
+import pytest
+
+from app.exceptions import CustomerNotFoundError, EmailAlreadyExistsError, ValidationError
+from app.repositories.customer_repo import CustomerRepository
 from app.services.customer_service import CustomerService
 
-# Number of records in the seed data (see app/data/mock_data.py)
-SEED_COUNT = 5
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
 
-class TestGetAll(unittest.TestCase):
+def _mock_customer(
+    id: int = 1,
+    name: str = "Alice Johnson",
+    email: str = "alice@example.com",
+    phone: str = "555-0101",
+    address: str = "1 Main St",
+) -> MagicMock:
+    """Return a MagicMock that mimics a Customer ORM object.
+
+    ``spec=Customer`` is intentionally omitted: Flask-SQLAlchemy's query
+    descriptor fires during spec introspection outside an app context,
+    causing a ``RuntimeError``.  Using a plain MagicMock is safe and
+    sufficient for testing the service layer.
+    """
+    m = MagicMock()
+    m.id = id
+    m.name = name
+    m.email = email
+    m.phone = phone
+    m.address = address
+    m.created_at = datetime(2024, 1, 1, tzinfo=timezone.utc)
+    m.to_dict.return_value = {
+        "id": id,
+        "name": name,
+        "email": email,
+        "phone": phone,
+        "address": address,
+        "created_at": "2024-01-01T00:00:00+00:00",
+    }
+    return m
+
+
+@pytest.fixture()
+def mock_repo() -> MagicMock:
+    """Return a MagicMock with the same spec as CustomerRepository."""
+    return MagicMock(spec=CustomerRepository)
+
+
+@pytest.fixture()
+def service(mock_repo) -> CustomerService:
+    """CustomerService under test, injected with the mock repository."""
+    return CustomerService(repository=mock_repo)
+
+
+# ---------------------------------------------------------------------------
+# get_all
+# ---------------------------------------------------------------------------
+
+
+class TestGetAll:
     """Tests for CustomerService.get_all."""
 
-    def setUp(self):
-        mock_data.reset_store()
-        self.service = CustomerService()
+    def test_returns_serialised_list(self, service, mock_repo):
+        mock_repo.get_all.return_value = [_mock_customer(id=1), _mock_customer(id=2)]
+        result = service.get_all()
+        assert isinstance(result, list)
+        assert len(result) == 2
 
-    def test_returns_list(self):
-        """get_all should return a list."""
-        result = self.service.get_all()
-        self.assertIsInstance(result, list)
+    def test_each_item_is_dict(self, service, mock_repo):
+        mock_repo.get_all.return_value = [_mock_customer()]
+        for item in service.get_all():
+            assert isinstance(item, dict)
 
-    def test_returns_all_seed_records(self):
-        """get_all should return every seeded customer."""
-        result = self.service.get_all()
-        self.assertEqual(len(result), SEED_COUNT)
+    def test_empty_repository_returns_empty_list(self, service, mock_repo):
+        mock_repo.get_all.return_value = []
+        assert service.get_all() == []
 
-    def test_each_item_is_dict(self):
-        """Every item in the result should be a plain dictionary."""
-        for item in self.service.get_all():
-            with self.subTest(item=item):
-                self.assertIsInstance(item, dict)
-
-    def test_items_contain_required_keys(self):
-        """Each customer dict must expose all model fields."""
-        required_keys = {"id", "name", "email", "phone", "address", "created_at"}
-        for item in self.service.get_all():
-            with self.subTest(item=item):
-                self.assertTrue(required_keys.issubset(item.keys()))
+    def test_delegates_to_repository_get_all(self, service, mock_repo):
+        mock_repo.get_all.return_value = []
+        service.get_all()
+        mock_repo.get_all.assert_called_once()
 
 
-class TestGetById(unittest.TestCase):
+# ---------------------------------------------------------------------------
+# get_by_id
+# ---------------------------------------------------------------------------
+
+
+class TestGetById:
     """Tests for CustomerService.get_by_id."""
 
-    def setUp(self):
-        mock_data.reset_store()
-        self.service = CustomerService()
+    def test_returns_dict_for_existing_id(self, service, mock_repo):
+        mock_repo.get_by_id.return_value = _mock_customer(id=1)
+        result = service.get_by_id(1)
+        assert isinstance(result, dict)
+        assert result["id"] == 1
 
-    def test_returns_existing_customer(self):
-        """get_by_id should return the matching customer dict."""
-        result = self.service.get_by_id(1)
-        self.assertIsNotNone(result)
-        self.assertEqual(result["id"], 1)
+    def test_raises_customer_not_found_error(self, service, mock_repo):
+        mock_repo.get_by_id.return_value = None
+        with pytest.raises(CustomerNotFoundError) as exc_info:
+            service.get_by_id(99)
+        assert exc_info.value.customer_id == 99
 
-    def test_name_matches_seed_data(self):
-        """Customer 1 should be Alice Johnson from the seed data."""
-        result = self.service.get_by_id(1)
-        self.assertEqual(result["name"], "Alice Johnson")
+    def test_error_message_contains_id(self, service, mock_repo):
+        mock_repo.get_by_id.return_value = None
+        with pytest.raises(CustomerNotFoundError) as exc_info:
+            service.get_by_id(42)
+        assert "42" in str(exc_info.value)
 
-    def test_returns_none_for_missing_id(self):
-        """get_by_id should return None when the ID does not exist."""
-        result = self.service.get_by_id(9999)
-        self.assertIsNone(result)
-
-    def test_returns_none_for_zero_id(self):
-        """ID 0 does not exist in the seed data."""
-        result = self.service.get_by_id(0)
-        self.assertIsNone(result)
+    def test_delegates_to_repository_get_by_id(self, service, mock_repo):
+        mock_repo.get_by_id.return_value = _mock_customer()
+        service.get_by_id(1)
+        mock_repo.get_by_id.assert_called_once_with(1)
 
 
-class TestCreate(unittest.TestCase):
-    """Tests for CustomerService.create."""
-
-    def setUp(self):
-        mock_data.reset_store()
-        self.service = CustomerService()
-        self.valid_payload = {
-            "name": "Frank Castle",
-            "email": "frank.castle@example.com",
-            "phone": "555-0200",
-            "address": "10 Hell's Kitchen, New York, NY",
-        }
-
-    def test_create_returns_dict(self):
-        """create should return a dict representing the new customer."""
-        result = self.service.create(self.valid_payload)
-        self.assertIsInstance(result, dict)
-
-    def test_create_assigns_new_id(self):
-        """The new customer should receive an ID greater than 5."""
-        result = self.service.create(self.valid_payload)
-        self.assertGreater(result["id"], SEED_COUNT)
-
-    def test_create_persists_record(self):
-        """After creation the record must be retrievable."""
-        created = self.service.create(self.valid_payload)
-        fetched = self.service.get_by_id(created["id"])
-        self.assertIsNotNone(fetched)
-        self.assertEqual(fetched["email"], "frank.castle@example.com")
-
-    def test_create_increments_total_count(self):
-        """Total customer count should increase by 1 after creation."""
-        self.service.create(self.valid_payload)
-        self.assertEqual(len(self.service.get_all()), SEED_COUNT + 1)
-
-    def test_create_normalises_email_to_lowercase(self):
-        """Emails should be stored in lowercase."""
-        payload = dict(self.valid_payload, email="UPPER@EXAMPLE.COM")
-        result = self.service.create(payload)
-        self.assertEqual(result["email"], "upper@example.com")
-
-    def test_create_raises_on_missing_name(self):
-        """ValueError must be raised when 'name' is absent."""
-        payload = {k: v for k, v in self.valid_payload.items() if k != "name"}
-        with self.assertRaises(ValueError):
-            self.service.create(payload)
-
-    def test_create_raises_on_missing_email(self):
-        """ValueError must be raised when 'email' is absent."""
-        payload = {k: v for k, v in self.valid_payload.items() if k != "email"}
-        with self.assertRaises(ValueError):
-            self.service.create(payload)
-
-    def test_create_raises_on_missing_phone(self):
-        """ValueError must be raised when 'phone' is absent."""
-        payload = {k: v for k, v in self.valid_payload.items() if k != "phone"}
-        with self.assertRaises(ValueError):
-            self.service.create(payload)
-
-    def test_create_raises_on_missing_address(self):
-        """ValueError must be raised when 'address' is absent."""
-        payload = {k: v for k, v in self.valid_payload.items() if k != "address"}
-        with self.assertRaises(ValueError):
-            self.service.create(payload)
-
-    def test_create_raises_on_duplicate_email(self):
-        """Creating two customers with the same email must raise ValueError."""
-        self.service.create(self.valid_payload)
-        with self.assertRaises(ValueError):
-            self.service.create(self.valid_payload)
-
-    def test_create_error_message_mentions_duplicate_email(self):
-        """The duplicate-email error message should name the address."""
-        self.service.create(self.valid_payload)
-        with self.assertRaises(ValueError) as ctx:
-            self.service.create(self.valid_payload)
-        self.assertIn("frank.castle@example.com", str(ctx.exception))
+# ---------------------------------------------------------------------------
+# create
+# ---------------------------------------------------------------------------
 
 
-class TestUpdate(unittest.TestCase):
+_VALID_PAYLOAD = {
+    "name": "Jane Doe",
+    "email": "jane.doe@example.com",
+    "phone": "555-9999",
+    "address": "1 Example Lane, Austin, TX",
+}
+
+
+class TestCreate:
+    """Tests for CustomerService.create – happy path."""
+
+    def test_returns_customer_dict(self, service, mock_repo):
+        mock_repo.get_by_email.return_value = None
+        mock_repo.add.return_value = _mock_customer(email="jane.doe@example.com")
+        result = service.create(_VALID_PAYLOAD.copy())
+        assert isinstance(result, dict)
+
+    def test_email_is_lower_cased(self, service, mock_repo):
+        mock_repo.get_by_email.return_value = None
+        created = _mock_customer(email="jane.doe@example.com")
+        mock_repo.add.return_value = created
+        service.create({**_VALID_PAYLOAD, "email": "Jane.Doe@EXAMPLE.com"})
+        # Verify the Customer was built with a lower-cased email
+        call_args = mock_repo.add.call_args[0][0]
+        assert call_args.email == "jane.doe@example.com"
+
+    def test_name_is_stripped(self, service, mock_repo):
+        mock_repo.get_by_email.return_value = None
+        mock_repo.add.return_value = _mock_customer()
+        service.create({**_VALID_PAYLOAD, "name": "  Jane Doe  "})
+        call_args = mock_repo.add.call_args[0][0]
+        assert call_args.name == "Jane Doe"
+
+    def test_delegates_add_to_repository(self, service, mock_repo):
+        mock_repo.get_by_email.return_value = None
+        mock_repo.add.return_value = _mock_customer()
+        service.create(_VALID_PAYLOAD.copy())
+        mock_repo.add.assert_called_once()
+
+
+class TestCreate_Validation:
+    """Tests for CustomerService.create – validation errors."""
+
+    @pytest.mark.parametrize("missing_field", ["name", "email", "phone", "address"])
+    def test_raises_validation_error_for_missing_field(self, missing_field, service, mock_repo):
+        payload = {k: v for k, v in _VALID_PAYLOAD.items() if k != missing_field}
+        with pytest.raises(ValidationError):
+            service.create(payload)
+
+    @pytest.mark.parametrize("blank_field", ["name", "email", "phone", "address"])
+    def test_raises_validation_error_for_blank_field(self, blank_field, service, mock_repo):
+        payload = {**_VALID_PAYLOAD, blank_field: "   "}
+        with pytest.raises(ValidationError):
+            service.create(payload)
+
+    def test_raises_email_already_exists_error(self, service, mock_repo):
+        mock_repo.get_by_email.return_value = _mock_customer()
+        with pytest.raises(EmailAlreadyExistsError) as exc_info:
+            service.create(_VALID_PAYLOAD.copy())
+        assert "jane.doe@example.com" in str(exc_info.value)
+
+
+# ---------------------------------------------------------------------------
+# update
+# ---------------------------------------------------------------------------
+
+
+class TestUpdate:
     """Tests for CustomerService.update."""
 
-    def setUp(self):
-        mock_data.reset_store()
-        self.service = CustomerService()
+    def test_updates_name(self, service, mock_repo):
+        customer = _mock_customer(id=1, name="Old Name")
+        mock_repo.get_by_id.return_value = customer
+        mock_repo.save.return_value = customer
+        service.update(1, {"name": "New Name"})
+        assert customer.name == "New Name"
 
-    def test_update_phone_returns_updated_dict(self):
-        """update should return the modified customer dict."""
-        result = self.service.update(1, {"phone": "555-9999"})
-        self.assertIsNotNone(result)
-        self.assertEqual(result["phone"], "555-9999")
+    def test_updates_phone(self, service, mock_repo):
+        customer = _mock_customer(id=1)
+        mock_repo.get_by_id.return_value = customer
+        mock_repo.save.return_value = customer
+        service.update(1, {"phone": "555-9999"})
+        assert customer.phone == "555-9999"
 
-    def test_update_name(self):
-        """Updating the name field should be reflected in get_by_id."""
-        self.service.update(1, {"name": "Alicia Johnson"})
-        fetched = self.service.get_by_id(1)
-        self.assertEqual(fetched["name"], "Alicia Johnson")
+    def test_updates_email_when_unique(self, service, mock_repo):
+        customer = _mock_customer(id=1, email="old@example.com")
+        mock_repo.get_by_id.return_value = customer
+        mock_repo.get_by_email.return_value = None
+        mock_repo.save.return_value = customer
+        service.update(1, {"email": "new@example.com"})
+        assert customer.email == "new@example.com"
 
-    def test_update_address(self):
-        """Updating address should persist."""
-        self.service.update(2, {"address": "999 New St, Boston, MA"})
-        fetched = self.service.get_by_id(2)
-        self.assertEqual(fetched["address"], "999 New St, Boston, MA")
+    def test_raises_customer_not_found_error(self, service, mock_repo):
+        mock_repo.get_by_id.return_value = None
+        with pytest.raises(CustomerNotFoundError):
+            service.update(99, {"name": "X"})
 
-    def test_update_email_normalised_to_lowercase(self):
-        """Updated emails should be normalised to lowercase."""
-        self.service.update(1, {"email": "ALICE.NEW@EXAMPLE.COM"})
-        fetched = self.service.get_by_id(1)
-        self.assertEqual(fetched["email"], "alice.new@example.com")
+    def test_raises_email_already_exists_when_taken(self, service, mock_repo):
+        customer = _mock_customer(id=1, email="old@example.com")
+        other = _mock_customer(id=2, email="taken@example.com")
+        mock_repo.get_by_id.return_value = customer
+        mock_repo.get_by_email.return_value = other
+        with pytest.raises(EmailAlreadyExistsError):
+            service.update(1, {"email": "taken@example.com"})
 
-    def test_update_preserves_unchanged_fields(self):
-        """Fields not included in the update payload should remain unchanged."""
-        original = self.service.get_by_id(3)
-        self.service.update(3, {"phone": "000-0000"})
-        updated = self.service.get_by_id(3)
-        self.assertEqual(updated["name"], original["name"])
-        self.assertEqual(updated["email"], original["email"])
-        self.assertEqual(updated["address"], original["address"])
+    def test_no_email_conflict_keeping_same_email(self, service, mock_repo):
+        """Updating with the customer's own email must not raise."""
+        customer = _mock_customer(id=1, email="same@example.com")
+        mock_repo.get_by_id.return_value = customer
+        mock_repo.save.return_value = customer
+        # Should NOT call get_by_email because email is unchanged
+        service.update(1, {"email": "same@example.com"})
+        mock_repo.get_by_email.assert_not_called()
 
-    def test_update_returns_none_for_missing_id(self):
-        """update should return None when the customer does not exist."""
-        result = self.service.update(9999, {"name": "Ghost"})
-        self.assertIsNone(result)
-
-    def test_update_raises_on_duplicate_email(self):
-        """Changing email to one already used by another customer raises ValueError."""
-        # Customer 2's email is bob.smith@example.com
-        with self.assertRaises(ValueError):
-            self.service.update(1, {"email": "bob.smith@example.com"})
-
-    def test_update_same_email_allowed(self):
-        """A customer may be updated keeping their own existing email."""
-        original = self.service.get_by_id(1)
-        result = self.service.update(1, {"email": original["email"], "phone": "999-9999"})
-        self.assertIsNotNone(result)
-        self.assertEqual(result["email"], original["email"])
+    def test_blank_name_not_applied(self, service, mock_repo):
+        customer = _mock_customer(id=1, name="Keep This")
+        mock_repo.get_by_id.return_value = customer
+        mock_repo.save.return_value = customer
+        service.update(1, {"name": "   "})
+        assert customer.name == "Keep This"
 
 
-class TestDelete(unittest.TestCase):
+# ---------------------------------------------------------------------------
+# delete
+# ---------------------------------------------------------------------------
+
+
+class TestDelete:
     """Tests for CustomerService.delete."""
 
-    def setUp(self):
-        mock_data.reset_store()
-        self.service = CustomerService()
+    def test_calls_repository_delete(self, service, mock_repo):
+        customer = _mock_customer()
+        mock_repo.get_by_id.return_value = customer
+        service.delete(1)
+        mock_repo.delete.assert_called_once_with(customer)
 
-    def test_delete_existing_returns_true(self):
-        """Deleting an existing customer should return True."""
-        result = self.service.delete(1)
-        self.assertTrue(result)
+    def test_raises_customer_not_found_error(self, service, mock_repo):
+        mock_repo.get_by_id.return_value = None
+        with pytest.raises(CustomerNotFoundError) as exc_info:
+            service.delete(99)
+        assert exc_info.value.customer_id == 99
 
-    def test_delete_reduces_count(self):
-        """Customer count should decrease by 1 after deletion."""
-        self.service.delete(1)
-        self.assertEqual(len(self.service.get_all()), SEED_COUNT - 1)
-
-    def test_delete_makes_id_unreachable(self):
-        """After deletion, get_by_id should return None for that ID."""
-        self.service.delete(2)
-        self.assertIsNone(self.service.get_by_id(2))
-
-    def test_delete_nonexistent_returns_false(self):
-        """Deleting an ID that does not exist should return False."""
-        result = self.service.delete(9999)
-        self.assertFalse(result)
-
-    def test_double_delete_returns_false(self):
-        """Deleting the same ID twice: first True, second False."""
-        self.assertTrue(self.service.delete(3))
-        self.assertFalse(self.service.delete(3))
-
-
-if __name__ == "__main__":
-    unittest.main(verbosity=2)
+    def test_does_not_call_delete_when_not_found(self, service, mock_repo):
+        mock_repo.get_by_id.return_value = None
+        with pytest.raises(CustomerNotFoundError):
+            service.delete(99)
+        mock_repo.delete.assert_not_called()

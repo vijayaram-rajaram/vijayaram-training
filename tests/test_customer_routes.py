@@ -7,56 +7,59 @@ Each test uses Flask's built-in test client so the full HTTP stack
 (routing, serialisation, status codes, response envelope) is exercised
 without starting a real server.
 
-``mock_data.reset_store()`` is called in ``setUp`` to guarantee a clean
-5-record state before every test case.
+The ``client`` and ``db`` fixtures (from ``conftest.py``) provide a
+fresh in-memory SQLite database per test, ensuring full isolation.
+
+Test groups
+-----------
+TestListCustomers     – GET  /api/customers
+TestGetCustomer       – GET  /api/customers/<id>
+TestCreateCustomer    – POST /api/customers
+TestUpdateCustomer    – PUT  /api/customers/<id>
+TestDeleteCustomer    – DELETE /api/customers/<id>
 """
 
 import json
-import unittest
 
-from app import create_app
-from app.data import mock_data
+import pytest
 
-SEED_COUNT = 5
+from app.models.customer import Customer
 
 
-class BaseTestCase(unittest.TestCase):
-    """Base class that wires up the Flask test client and resets state."""
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
-    def setUp(self):
-        mock_data.reset_store()
-        self.app = create_app()
-        self.app.config["TESTING"] = True
-        self.client = self.app.test_client()
 
-    # ------------------------------------------------------------------
-    # Convenience helpers
-    # ------------------------------------------------------------------
+def _post_json(client, url: str, payload: dict):
+    return client.post(url, data=json.dumps(payload), content_type="application/json")
 
-    def _get(self, url: str):
-        return self.client.get(url)
 
-    def _post(self, url: str, payload: dict):
-        return self.client.post(
-            url,
-            data=json.dumps(payload),
-            content_type="application/json",
+def _put_json(client, url: str, payload: dict):
+    return client.put(url, data=json.dumps(payload), content_type="application/json")
+
+
+def _json(response) -> dict:
+    return json.loads(response.data)
+
+
+def _seed(db, count: int = 3) -> list[Customer]:
+    """Insert *count* customers and return them."""
+    customers = []
+    for i in range(1, count + 1):
+        c = Customer(
+            name=f"User {i}",
+            email=f"user{i}@example.com",
+            phone=f"555-000{i}",
+            address=f"{i} Test St",
         )
+        db.session.add(c)
+    db.session.commit()
+    customers = db.session.query(Customer).order_by(Customer.id).all()
+    return customers
 
-    def _put(self, url: str, payload: dict):
-        return self.client.put(
-            url,
-            data=json.dumps(payload),
-            content_type="application/json",
-        )
 
-    def _delete(self, url: str):
-        return self.client.delete(url)
-
-    @staticmethod
-    def _json(response) -> dict:
-        """Return the parsed JSON body of a response."""
-        return json.loads(response.data)
+BASE = "/api/customers"
 
 
 # ---------------------------------------------------------------------------
@@ -64,33 +67,35 @@ class BaseTestCase(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 
-class TestListCustomers(BaseTestCase):
+class TestListCustomers:
     """Tests for GET /api/customers."""
 
-    def test_status_200(self):
-        """Listing customers should return HTTP 200."""
-        response = self._get("/api/customers")
-        self.assertEqual(response.status_code, 200)
+    def test_status_200_on_empty_db(self, client, db):
+        response = client.get(BASE)
+        assert response.status_code == 200
 
-    def test_response_envelope_status_success(self):
-        """Response envelope must have status='success'."""
-        body = self._json(self._get("/api/customers"))
-        self.assertEqual(body["status"], "success")
+    def test_envelope_status_success(self, client, db):
+        body = _json(client.get(BASE))
+        assert body["status"] == "success"
 
-    def test_count_matches_seed(self):
-        """count field must equal the number of seed records."""
-        body = self._json(self._get("/api/customers"))
-        self.assertEqual(body["count"], SEED_COUNT)
+    def test_count_matches_seeded_records(self, client, db):
+        _seed(db, 3)
+        body = _json(client.get(BASE))
+        assert body["count"] == 3
+        assert len(body["data"]) == 3
 
-    def test_data_is_list(self):
-        """data field must be a list."""
-        body = self._json(self._get("/api/customers"))
-        self.assertIsInstance(body["data"], list)
+    def test_returns_expected_fields(self, client, db):
+        _seed(db, 1)
+        body = _json(client.get(BASE))
+        customer = body["data"][0]
+        assert {"id", "name", "email", "phone", "address", "created_at"}.issubset(
+            customer.keys()
+        )
 
-    def test_data_length_matches_count(self):
-        """The length of data must equal count."""
-        body = self._json(self._get("/api/customers"))
-        self.assertEqual(len(body["data"]), body["count"])
+    def test_empty_database_returns_empty_list(self, client, db):
+        body = _json(client.get(BASE))
+        assert body["data"] == []
+        assert body["count"] == 0
 
 
 # ---------------------------------------------------------------------------
@@ -98,35 +103,27 @@ class TestListCustomers(BaseTestCase):
 # ---------------------------------------------------------------------------
 
 
-class TestGetCustomer(BaseTestCase):
+class TestGetCustomer:
     """Tests for GET /api/customers/<id>."""
 
-    def test_existing_id_returns_200(self):
-        """A valid customer ID must return 200."""
-        response = self._get("/api/customers/1")
-        self.assertEqual(response.status_code, 200)
+    def test_status_200_for_existing_customer(self, client, db):
+        seeded = _seed(db, 1)
+        response = client.get(f"{BASE}/{seeded[0].id}")
+        assert response.status_code == 200
 
-    def test_existing_id_returns_correct_data(self):
-        """The correct customer should be returned for the given ID."""
-        body = self._json(self._get("/api/customers/1"))
-        self.assertEqual(body["status"], "success")
-        self.assertEqual(body["data"]["id"], 1)
-        self.assertEqual(body["data"]["name"], "Alice Johnson")
+    def test_returns_correct_customer(self, client, db):
+        seeded = _seed(db, 2)
+        body = _json(client.get(f"{BASE}/{seeded[1].id}"))
+        assert body["data"]["email"] == "user2@example.com"
 
-    def test_missing_id_returns_404(self):
-        """A non-existent customer ID must return 404."""
-        response = self._get("/api/customers/9999")
-        self.assertEqual(response.status_code, 404)
+    def test_status_404_for_missing_customer(self, client, db):
+        response = client.get(f"{BASE}/99999")
+        assert response.status_code == 404
 
-    def test_missing_id_body_has_error_status(self):
-        """404 response body must carry status='error'."""
-        body = self._json(self._get("/api/customers/9999"))
-        self.assertEqual(body["status"], "error")
-
-    def test_missing_id_body_contains_message(self):
-        """404 body should mention the requested ID in the message."""
-        body = self._json(self._get("/api/customers/9999"))
-        self.assertIn("9999", body["message"])
+    def test_404_body_has_error_status(self, client, db):
+        body = _json(client.get(f"{BASE}/99999"))
+        assert body["status"] == "error"
+        assert "99999" in body["message"]
 
 
 # ---------------------------------------------------------------------------
@@ -134,65 +131,56 @@ class TestGetCustomer(BaseTestCase):
 # ---------------------------------------------------------------------------
 
 
-class TestCreateCustomer(BaseTestCase):
+_NEW_CUSTOMER = {
+    "name": "Jane Doe",
+    "email": "jane.doe@example.com",
+    "phone": "555-9999",
+    "address": "1 Example Lane, Austin, TX",
+}
+
+
+class TestCreateCustomer:
     """Tests for POST /api/customers."""
 
-    _VALID = {
-        "name": "Grace Hopper",
-        "email": "grace.hopper@example.com",
-        "phone": "555-0300",
-        "address": "1 Navy Yard, Washington, DC",
-    }
+    def test_status_201_on_success(self, client, db):
+        response = _post_json(client, BASE, _NEW_CUSTOMER)
+        assert response.status_code == 201
 
-    def test_valid_payload_returns_201(self):
-        """A valid create request should return 201 Created."""
-        response = self._post("/api/customers", self._VALID)
-        self.assertEqual(response.status_code, 201)
+    def test_response_contains_id(self, client, db):
+        body = _json(_post_json(client, BASE, _NEW_CUSTOMER))
+        assert "id" in body["data"]
+        assert body["data"]["id"] is not None
 
-    def test_valid_payload_returns_success_status(self):
-        """Response envelope must have status='success'."""
-        body = self._json(self._post("/api/customers", self._VALID))
-        self.assertEqual(body["status"], "success")
+    def test_email_stored_lowercased(self, client, db):
+        payload = {**_NEW_CUSTOMER, "email": "JANE.DOE@EXAMPLE.COM"}
+        body = _json(_post_json(client, BASE, payload))
+        assert body["data"]["email"] == "jane.doe@example.com"
 
-    def test_created_customer_has_id(self):
-        """The created customer dict must include an integer id."""
-        body = self._json(self._post("/api/customers", self._VALID))
-        self.assertIn("id", body["data"])
-        self.assertIsInstance(body["data"]["id"], int)
+    def test_status_400_for_non_json_body(self, client, db):
+        response = client.post(BASE, data="not json", content_type="text/plain")
+        assert response.status_code == 400
 
-    def test_created_email_normalised(self):
-        """Email in response must be lowercase."""
-        payload = dict(self._VALID, email="GRACE@EXAMPLE.COM")
-        body = self._json(self._post("/api/customers", payload))
-        self.assertEqual(body["data"]["email"], "grace@example.com")
+    def test_status_422_for_missing_required_field(self, client, db):
+        payload = {k: v for k, v in _NEW_CUSTOMER.items() if k != "email"}
+        response = _post_json(client, BASE, payload)
+        assert response.status_code == 422
 
-    def test_list_grows_after_create(self):
-        """Customer count should increase by 1 after a successful create."""
-        self._post("/api/customers", self._VALID)
-        body = self._json(self._get("/api/customers"))
-        self.assertEqual(body["count"], SEED_COUNT + 1)
+    def test_status_422_for_duplicate_email(self, client, db):
+        _post_json(client, BASE, _NEW_CUSTOMER)
+        response = _post_json(client, BASE, _NEW_CUSTOMER)
+        assert response.status_code == 422
 
-    def test_missing_field_returns_422(self):
-        """Payload missing a required field should return 422."""
-        payload = {k: v for k, v in self._VALID.items() if k != "email"}
-        response = self._post("/api/customers", payload)
-        self.assertEqual(response.status_code, 422)
+    def test_error_message_on_duplicate_email(self, client, db):
+        _post_json(client, BASE, _NEW_CUSTOMER)
+        body = _json(_post_json(client, BASE, _NEW_CUSTOMER))
+        assert body["status"] == "error"
+        assert "jane.doe@example.com" in body["message"]
 
-    def test_duplicate_email_returns_422(self):
-        """Duplicate email on create should return 422."""
-        self._post("/api/customers", self._VALID)
-        response = self._post("/api/customers", self._VALID)
-        self.assertEqual(response.status_code, 422)
-
-    def test_no_body_returns_400(self):
-        """A request with no JSON body should return 400."""
-        response = self.client.post("/api/customers")
-        self.assertEqual(response.status_code, 400)
-
-    def test_empty_json_object_returns_422(self):
-        """An empty JSON body {} should return 422 (missing required fields)."""
-        response = self._post("/api/customers", {})
-        self.assertEqual(response.status_code, 422)
+    def test_record_persisted_after_create(self, client, db):
+        create_body = _json(_post_json(client, BASE, _NEW_CUSTOMER))
+        new_id = create_body["data"]["id"]
+        get_body = _json(client.get(f"{BASE}/{new_id}"))
+        assert get_body["data"]["name"] == "Jane Doe"
 
 
 # ---------------------------------------------------------------------------
@@ -200,48 +188,52 @@ class TestCreateCustomer(BaseTestCase):
 # ---------------------------------------------------------------------------
 
 
-class TestUpdateCustomer(BaseTestCase):
+class TestUpdateCustomer:
     """Tests for PUT /api/customers/<id>."""
 
-    def test_valid_update_returns_200(self):
-        """Updating an existing customer should return 200."""
-        response = self._put("/api/customers/1", {"phone": "555-9999"})
-        self.assertEqual(response.status_code, 200)
+    def test_status_200_on_success(self, client, db):
+        seeded = _seed(db, 1)
+        response = _put_json(client, f"{BASE}/{seeded[0].id}", {"phone": "999-0000"})
+        assert response.status_code == 200
 
-    def test_update_reflects_new_value(self):
-        """The updated field should appear in the response data."""
-        body = self._json(self._put("/api/customers/1", {"phone": "555-9999"}))
-        self.assertEqual(body["data"]["phone"], "555-9999")
+    def test_field_updated_in_response(self, client, db):
+        seeded = _seed(db, 1)
+        body = _json(_put_json(client, f"{BASE}/{seeded[0].id}", {"name": "Updated"}))
+        assert body["data"]["name"] == "Updated"
 
-    def test_update_preserves_other_fields(self):
-        """Fields not in the payload must remain unchanged."""
-        original = self._json(self._get("/api/customers/2"))["data"]
-        self._put("/api/customers/2", {"phone": "000-0000"})
-        updated = self._json(self._get("/api/customers/2"))["data"]
-        self.assertEqual(updated["name"], original["name"])
-        self.assertEqual(updated["email"], original["email"])
-        self.assertEqual(updated["address"], original["address"])
+    def test_untouched_fields_unchanged(self, client, db):
+        seeded = _seed(db, 1)
+        original_email = seeded[0].email
+        _put_json(client, f"{BASE}/{seeded[0].id}", {"phone": "000-0000"})
+        body = _json(client.get(f"{BASE}/{seeded[0].id}"))
+        assert body["data"]["email"] == original_email
 
-    def test_update_nonexistent_returns_404(self):
-        """Updating a non-existent customer should return 404."""
-        response = self._put("/api/customers/9999", {"name": "Nobody"})
-        self.assertEqual(response.status_code, 404)
+    def test_status_404_for_missing_customer(self, client, db):
+        response = _put_json(client, f"{BASE}/99999", {"phone": "000-0000"})
+        assert response.status_code == 404
 
-    def test_update_duplicate_email_returns_422(self):
-        """Changing email to an existing email should return 422."""
-        response = self._put("/api/customers/1", {"email": "bob.smith@example.com"})
-        self.assertEqual(response.status_code, 422)
+    def test_status_422_for_duplicate_email(self, client, db):
+        seeded = _seed(db, 2)
+        response = _put_json(
+            client,
+            f"{BASE}/{seeded[0].id}",
+            {"email": seeded[1].email},
+        )
+        assert response.status_code == 422
 
-    def test_update_same_email_returns_200(self):
-        """Submitting the same email for the same customer should succeed."""
-        original_email = self._json(self._get("/api/customers/1"))["data"]["email"]
-        response = self._put("/api/customers/1", {"email": original_email})
-        self.assertEqual(response.status_code, 200)
+    def test_status_400_for_missing_body(self, client, db):
+        seeded = _seed(db, 1)
+        response = client.put(f"{BASE}/{seeded[0].id}", content_type="application/json")
+        assert response.status_code == 400
 
-    def test_no_body_returns_400(self):
-        """PUT with no JSON body should return 400."""
-        response = self.client.put("/api/customers/1")
-        self.assertEqual(response.status_code, 400)
+    def test_keeping_own_email_does_not_conflict(self, client, db):
+        seeded = _seed(db, 1)
+        response = _put_json(
+            client,
+            f"{BASE}/{seeded[0].id}",
+            {"email": seeded[0].email, "phone": "888-0000"},
+        )
+        assert response.status_code == 200
 
 
 # ---------------------------------------------------------------------------
@@ -249,42 +241,30 @@ class TestUpdateCustomer(BaseTestCase):
 # ---------------------------------------------------------------------------
 
 
-class TestDeleteCustomer(BaseTestCase):
+class TestDeleteCustomer:
     """Tests for DELETE /api/customers/<id>."""
 
-    def test_existing_delete_returns_200(self):
-        """Deleting an existing customer should return 200."""
-        response = self._delete("/api/customers/1")
-        self.assertEqual(response.status_code, 200)
+    def test_status_200_on_success(self, client, db):
+        seeded = _seed(db, 1)
+        response = client.delete(f"{BASE}/{seeded[0].id}")
+        assert response.status_code == 200
 
-    def test_delete_success_message(self):
-        """Response body should confirm the deletion with status='success'."""
-        body = self._json(self._delete("/api/customers/1"))
-        self.assertEqual(body["status"], "success")
+    def test_success_message_contains_id(self, client, db):
+        seeded = _seed(db, 1)
+        body = _json(client.delete(f"{BASE}/{seeded[0].id}"))
+        assert str(seeded[0].id) in body["message"]
 
-    def test_deleted_customer_not_retrievable(self):
-        """After deletion, GET on that ID should return 404."""
-        self._delete("/api/customers/1")
-        response = self._get("/api/customers/1")
-        self.assertEqual(response.status_code, 404)
+    def test_record_removed_after_delete(self, client, db):
+        seeded = _seed(db, 1)
+        customer_id = seeded[0].id
+        client.delete(f"{BASE}/{customer_id}")
+        response = client.get(f"{BASE}/{customer_id}")
+        assert response.status_code == 404
 
-    def test_delete_reduces_count(self):
-        """Customer list count should decrease by 1 after deletion."""
-        self._delete("/api/customers/1")
-        body = self._json(self._get("/api/customers"))
-        self.assertEqual(body["count"], SEED_COUNT - 1)
+    def test_status_404_for_missing_customer(self, client, db):
+        response = client.delete(f"{BASE}/99999")
+        assert response.status_code == 404
 
-    def test_delete_nonexistent_returns_404(self):
-        """Deleting a non-existent customer should return 404."""
-        response = self._delete("/api/customers/9999")
-        self.assertEqual(response.status_code, 404)
-
-    def test_double_delete_second_returns_404(self):
-        """Deleting the same ID twice should return 404 on the second call."""
-        self._delete("/api/customers/3")
-        response = self._delete("/api/customers/3")
-        self.assertEqual(response.status_code, 404)
-
-
-if __name__ == "__main__":
-    unittest.main(verbosity=2)
+    def test_404_body_has_error_status(self, client, db):
+        body = _json(client.delete(f"{BASE}/99999"))
+        assert body["status"] == "error"
