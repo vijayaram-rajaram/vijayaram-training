@@ -41,6 +41,14 @@ def create_app(config_name: str | None = None) -> Flask:
     app.config.from_object(config.get(config_name, config["default"]))
 
     # ------------------------------------------------------------------
+    # Production secret validation – fail fast before binding any port
+    # ------------------------------------------------------------------
+    if config_name == "production":
+        from app.secrets import validate_production_secrets  # noqa: PLC0415
+
+        validate_production_secrets()
+
+    # ------------------------------------------------------------------
     # Initialise extensions
     # ------------------------------------------------------------------
     db.init_app(app)
@@ -54,7 +62,9 @@ def create_app(config_name: str | None = None) -> Flask:
     # Register blueprints
     # ------------------------------------------------------------------
     from app.routes.customer_routes import customer_bp  # noqa: PLC0415
+    from app.routes.enrichment_routes import enrichment_bp  # noqa: PLC0415
 
     app.register_blueprint(customer_bp)
+    app.register_blueprint(enrichment_bp)
 
     return app

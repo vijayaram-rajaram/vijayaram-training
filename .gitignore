@@ -23,4 +23,7 @@ build/
 .ipynb_checkpoints/
 
 # Environment variables
+# .env.example is safe to commit – it contains no real secrets.
+# .env holds real values and must NEVER be committed.
 .env
+!.env.example

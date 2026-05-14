@@ -25,6 +25,31 @@ class _BaseConfig:
     SQLALCHEMY_TRACK_MODIFICATIONS = False
     SECRET_KEY: str = os.environ.get("SECRET_KEY", "dev-secret-change-in-production")
 
+    # ------------------------------------------------------------------
+    # Third-party integration settings
+    # All sensitive values (API keys, tokens) are read exclusively from
+    # environment variables – never hardcoded.
+    # ------------------------------------------------------------------
+
+    #: Base URL for the customer-enrichment API.
+    ENRICHMENT_API_BASE_URL: str = os.environ.get(
+        "ENRICHMENT_API_BASE_URL", "https://jsonplaceholder.typicode.com"
+    )
+
+    #: Optional Bearer token / API key for the enrichment API.
+    #: Leave unset (or blank) for APIs that do not require authentication
+    #: (e.g. the public JSONPlaceholder sandbox).
+    ENRICHMENT_API_KEY: str | None = os.environ.get("ENRICHMENT_API_KEY") or None
+
+    #: Per-request timeout in seconds for outbound HTTP calls.
+    ENRICHMENT_API_TIMEOUT: int = int(os.environ.get("ENRICHMENT_API_TIMEOUT", "10"))
+
+    #: Maximum number of retry attempts on transient failures (5xx / network).
+    ENRICHMENT_API_MAX_RETRIES: int = int(os.environ.get("ENRICHMENT_API_MAX_RETRIES", "3"))
+
+    #: Multiplier (seconds) for exponential back-off between retries.
+    ENRICHMENT_API_BACKOFF: float = float(os.environ.get("ENRICHMENT_API_BACKOFF", "0.5"))
+
 
 class DevelopmentConfig(_BaseConfig):
     """Local development: SQLite file on disk, debug output enabled."""
@@ -42,6 +67,11 @@ class TestingConfig(_BaseConfig):
     DEBUG = False
     # Each test receives a brand-new in-memory database – no shared state.
     SQLALCHEMY_DATABASE_URI: str = "sqlite:///:memory:"
+
+    # Use very short timeouts and disable real retries so tests are fast
+    # and do not make real outbound HTTP calls.
+    ENRICHMENT_API_TIMEOUT: int = 2
+    ENRICHMENT_API_MAX_RETRIES: int = 0
 
 
 class ProductionConfig(_BaseConfig):
